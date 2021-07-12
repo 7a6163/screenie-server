@@ -1,6 +1,4 @@
-FROM node:14-alpine3.12
-
-ARG TARGETPLATFORM
+FROM node:lts-alpine3.14
 
 ENV SCREENIE_VERSION=4.0.0
 ENV SCREENIE_CHROMIUM_ARGS=--no-sandbox
@@ -19,14 +17,10 @@ RUN apk update && apk upgrade && \
   harfbuzz \
   ttf-freefont \
   font-noto-cjk \
+  tini \
   git
 
-RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
-  wget -O /usr/local/bin/dumb-init https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64; else \
-  wget -O /usr/local/bin/dumb-init https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_aarch64; fi \
-  && chmod +x /usr/local/bin/dumb-init
-
-ENTRYPOINT ["dumb-init"]
+ENTRYPOINT ["/sbin/tini", "--"]
 
 RUN npm install -g screenie-server@${SCREENIE_VERSION} --unsafe-perm
 

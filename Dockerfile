@@ -20,10 +20,12 @@ RUN apk update && apk upgrade && \
   tini \
   git
 
-ENTRYPOINT ["/sbin/tini", "--"]
-
 RUN npm install -g screenie-server@${SCREENIE_VERSION} --unsafe-perm
 
 EXPOSE 3000
 
+HEALTHCHECK --interval=60s --timeout=10s --retries=3 CMD curl -fs http://localhost:3000 || exit 1
+
+ENTRYPOINT ["/sbin/tini", "--"]
 CMD /usr/local/bin/screenie
+

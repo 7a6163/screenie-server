@@ -1,4 +1,4 @@
-FROM node:lts-alpine3.14
+FROM node:lts-alpine
 
 ENV SCREENIE_VERSION=4.0.0
 ENV SCREENIE_CHROMIUM_ARGS=--no-sandbox
@@ -20,7 +20,7 @@ RUN apk update && apk upgrade && \
   tini \
   git
 
-RUN npm install -g screenie-server@${SCREENIE_VERSION} --unsafe-perm
+RUN npm install --location=global screenie-server@${SCREENIE_VERSION} --unsafe-perm
 
 EXPOSE 3000
 

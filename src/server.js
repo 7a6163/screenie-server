@@ -126,7 +126,7 @@ app.use(async (ctx, next) => {
   logger.log('verbose', `Attempting to load ${url}`);
 
   try {
-    const response = await page.goto(url);
+    const response = await page.goto(url, { waitUntil: 'networkidle0' });
     const status = response.status();
 
     if (status < 200 || status > 299) {

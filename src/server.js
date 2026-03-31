@@ -2,7 +2,8 @@
 
 const Koa = require('koa');
 const winston = require('winston');
-const createPuppeteerPool = require('puppeteer-pool').default;
+const puppeteer = require('puppeteer-core');
+const { Pool } = require('lightning-pool');
 const { combine, timestamp, printf } = winston.format;
 
 const loggerFormat = printf(({ message, timestamp }) => {
@@ -23,29 +24,59 @@ logger.log('verbose', 'Setting up defaults from environment');
 const chromiumArgs = process.env.SCREENIE_CHROMIUM_ARGS
   ? { args: process.env.SCREENIE_CHROMIUM_ARGS.split(' ') }
   : {};
-const chromiumExec = process.env.SCREENIE_CHROMIUM_EXEC
-  ? { executablePath: process.env.SCREENIE_CHROMIUM_EXEC }
-  : {};
+if (!process.env.SCREENIE_CHROMIUM_EXEC) {
+  logger.log('error', 'SCREENIE_CHROMIUM_EXEC must be set (puppeteer-core requires an explicit executable path)');
+  process.exit(1);
+}
+const chromiumExec = { executablePath: process.env.SCREENIE_CHROMIUM_EXEC };
 const defaultFormat = process.env.SCREENIE_DEFAULT_FORMAT || 'jpeg';
 const imageSize = {
-  width: process.env.SCREENIE_WIDTH || 1024,
-  height: process.env.SCREENIE_HEIGHT || 768,
+  width: parseInt(process.env.SCREENIE_WIDTH, 10) || 1024,
+  height: parseInt(process.env.SCREENIE_HEIGHT, 10) || 768,
 };
-const serverPort = process.env.SCREENIE_PORT || 3000;
+const serverPort = parseInt(process.env.SCREENIE_PORT, 10) || 3000;
 const supportedFormats = ['jpg', 'jpeg', 'pdf', 'png'];
-const allowFileScheme = process.env.SCREENIE_ALLOW_FILE_SCHEME || false;
+const allowFileScheme = process.env.SCREENIE_ALLOW_FILE_SCHEME === 'true';
+const blockedHosts = ['localhost', '127.0.0.1', '0.0.0.0', '[::1]', 'metadata.google.internal'];
+const blockedIPRanges = [
+  /^10\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^192\.168\./,
+  /^169\.254\./,
+  /^fd[0-9a-f]{2}:/i,
+  /^fe80:/i,
+];
 
 const app = new Koa();
 logger.log('verbose', 'Created KOA server');
 
-const pool = createPuppeteerPool({
-  min: process.env.SCREENIE_POOL_MIN || 2,
-  max: process.env.SCREENIE_POOL_MAX || 10,
-  puppeteerArgs: Object.assign({}, chromiumArgs, chromiumExec),
+const puppeteerArgs = Object.assign({}, chromiumArgs, chromiumExec);
+const browserFactory = {
+  create: async () => {
+    const browser = await puppeteer.launch(puppeteerArgs);
+    logger.log('verbose', `Launched browser with PID ${browser.process().pid}`);
+    return browser;
+  },
+  destroy: async (browser) => {
+    const pid = browser.process()?.pid;
+    logger.log('verbose', `Closing browser with PID ${pid}`);
+    await browser.close();
+  },
+  validate: async (browser) => {
+    return browser.isConnected();
+  },
+};
+
+const pool = new Pool(browserFactory, {
+  min: parseInt(process.env.SCREENIE_POOL_MIN, 10) || 2,
+  max: parseInt(process.env.SCREENIE_POOL_MAX, 10) || 10,
+  acquireTimeoutMillis: 30000,
+  idleTimeoutMillis: 60000,
 });
 
-const screenshotDelay = process.env.SCREENIE_SCREENSHOT_DELAY;
+const screenshotDelay = parseInt(process.env.SCREENIE_SCREENSHOT_DELAY, 10) || 0;
 
+pool.start();
 logger.log('verbose', 'Created Puppeteer pool');
 
 /*
@@ -55,9 +86,21 @@ logger.log('verbose', 'Created Puppeteer pool');
 process.on('SIGTERM', () => {
   logger.log('info', 'Received SIGTERM, exiting...');
   pool
-    .drain()
-    .then(() => pool.clear())
-    .then(() => process.exit(143));
+    .close(5000)
+    .then(() => process.exit(143))
+    .catch(error => {
+      logger.log('error', `Error during shutdown: ${error.message}`);
+      process.exit(1);
+    });
+});
+
+app.use(async (ctx, next) => {
+  if (ctx.path === '/health') {
+    ctx.status = 200;
+    ctx.body = 'ok';
+    return;
+  }
+  await next();
 });
 
 /**
@@ -69,38 +112,44 @@ app.use(async (ctx, next) => {
     width: Math.min(2048, parseInt(width, 10) || imageSize.width),
     height: Math.min(2048, parseInt(height, 10) || imageSize.height),
   };
-  let pageError;
-
   logger.log(
     'verbose',
     `Instantiating Page with size ${size.width}x${size.height}`
   );
 
-  await pool.use(instance => {
-    const pid = instance.process().pid;
+  const browser = await pool.acquire();
+  let shouldRelease = true;
+
+  try {
+    const pid = browser.process().pid;
     logger.log('verbose', `Using browser instance with PID ${pid}`);
-    return instance
-      .newPage()
-      .then(page => {
-        logger.log('verbose', 'Set page instance on state');
-        ctx.state.page = page;
-      })
-      .then(() => {
-        logger.log('verbose', 'Set viewport for page');
-        return ctx.state.page.setViewport(size);
-      })
-      .catch(error => {
-        pageError = error;
-        logger.log('verbose', `Invalidating instance with PID ${pid}`);
-        pool.invalidate(instance);
-      });
-  });
 
-  if (pageError) {
-    ctx.throw(400, `Could not open a page: ${pageError.message}`);
+    const page = await browser.newPage();
+    ctx.state.page = page;
+    logger.log('verbose', 'Set page instance on state');
+
+    await page.setViewport(size);
+    logger.log('verbose', 'Set viewport for page');
+
+    try {
+      await next();
+    } finally {
+      if (ctx.state.page) {
+        await ctx.state.page.close().catch(() => {});
+      }
+    }
+  } catch (error) {
+    if (!browser.isConnected()) {
+      logger.log('verbose', `Destroying disconnected browser`);
+      shouldRelease = false;
+      pool.destroy(browser);
+    }
+    throw error;
+  } finally {
+    if (shouldRelease) {
+      pool.release(browser);
+    }
   }
-
-  await next();
 });
 
 /**
@@ -119,14 +168,36 @@ app.use(async (ctx, next) => {
     ctx.throw(400, 'No url request parameter supplied.');
   }
 
-  if (url.indexOf('file://') >= 0 && !allowFileScheme) {
-    ctx.throw(403);
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch (e) {
+    ctx.throw(400, 'Invalid URL.');
+  }
+
+  if (parsedUrl.protocol === 'file:' && !allowFileScheme) {
+    ctx.throw(403, 'file:// scheme is not allowed.');
+  }
+
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'file:') {
+    ctx.throw(400, 'Only http, https, and file protocols are supported.');
+  }
+
+  const hostname = parsedUrl.hostname.toLowerCase();
+  if (blockedHosts.includes(hostname) || blockedIPRanges.some(re => re.test(hostname))) {
+    ctx.throw(403, 'Access to internal addresses is not allowed.');
   }
 
   logger.log('verbose', `Attempting to load ${url}`);
 
   try {
     const response = await page.goto(url, { waitUntil: 'networkidle0' });
+
+    if (!response) {
+      errorStatus = 502;
+      throw new Error('No response from page');
+    }
+
     const status = response.status();
 
     if (status < 200 || status > 299) {
@@ -179,57 +250,37 @@ app.use(async (ctx, next) => {
 app.use(async (ctx, next) => {
   const { url, fullPage } = ctx.request.query;
   const { format, page } = ctx.state;
-  const { width, height } = page.viewport();
-  let renderError;
+  const viewport = page.viewport();
+  const width = viewport?.width || imageSize.width;
+  const height = viewport?.height || imageSize.height;
 
   logger.log('info', `Rendering screenshot of ${url} to ${format}`);
 
-  if (format === 'pdf') {
-    await page
-      .pdf({
+  try {
+    if (format === 'pdf') {
+      ctx.body = await page.pdf({
         format: 'A4',
         margin: { top: '1cm', right: '1cm', bottom: '1cm', left: '1cm' },
-      })
-      .then(response => (ctx.body = response))
-      .catch(error => (renderError = error));
-  } else {
-    let clipInfo =
-      fullPage === '1'
-        ? { fullPage: true }
-        : { clip: { x: 0, y: 0, width: width, height: height } };
-    await page
-      .screenshot(
-        Object.assign(
-          {
-            type: format === 'jpg' ? 'jpeg' : format,
-            omitBackground: true,
-          },
-          clipInfo
-        )
-      )
-      .then(response => (ctx.body = response))
-      .catch(error => (renderError = error));
+      });
+    } else {
+      const clipInfo =
+        fullPage === '1'
+          ? { fullPage: true }
+          : { clip: { x: 0, y: 0, width, height } };
+      ctx.body = await page.screenshot({
+        type: format === 'jpg' ? 'jpeg' : format,
+        omitBackground: true,
+        ...clipInfo,
+      });
+    }
+  } catch (error) {
+    ctx.throw(400, `Could not render page: ${error.message}`);
   }
-
-  if (renderError) {
-    ctx.throw(400, `Could not render page: ${renderError.message}`);
-  }
-
-  await page.close();
 
   await next();
 });
 
-/**
- * Error handler to make sure page is getting closed.
- */
-app.on('error', (error, context) => {
-  const { page } = context.state;
-
-  if (page) {
-    page.close();
-  }
-
+app.on('error', (error) => {
   logger.log('error', error.message);
 });
 

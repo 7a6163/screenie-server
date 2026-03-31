@@ -1,6 +1,6 @@
 {
   "name": "screenie-server",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "description": "A screenshot HTTP service using Puppeteer",
   "author": "Frode Danielsen <frode@e5r.no>",
   "keywords": [
@@ -17,7 +17,7 @@
   },
   "license": "MIT",
   "engines": {
-    "node": ">=16.16.0"
+    "node": ">=24.0.0"
   },
   "repository": {
     "type": "git",
@@ -27,9 +27,9 @@
     "url": "https://github.com/eliksir/screenie-server/issues"
   },
   "dependencies": {
-    "koa": "2.13.1",
-    "puppeteer": "8.0.0",
-    "puppeteer-pool": "eliksir/puppeteer-pool#v1.3.1",
+    "koa": "^2.16.4",
+    "lightning-pool": "^4.12.0",
+    "puppeteer-core": "^24.40.0",
     "winston": "3.3.3"
   }
 }
